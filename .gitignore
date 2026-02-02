@@ -1,0 +1,9 @@
+*.o
+*.a
+*.so
+build/
+cupqc_sdk/
+*.pem
+*.crt
+*.key
+*.txt
