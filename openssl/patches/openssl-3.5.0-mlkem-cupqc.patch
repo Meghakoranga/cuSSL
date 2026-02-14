@@ -1,0 +1,215 @@
+--- upstream/openssl/crypto/ml_kem/ml_kem.c	2026-02-02 12:57:21.435417013 +0000
++++ openssl-openssl-3.5.0/crypto/ml_kem/ml_kem.c	2026-02-13 15:55:24.882586905 +0000
+@@ -13,7 +13,8 @@
+ #include "internal/common.h"
+ #include "internal/constant_time.h"
+ #include "internal/sha3.h"
+-
++#include <openssl/async.h>
++#include "cupqc_batch.h"
+ #if defined(OPENSSL_CONSTANT_TIME_VALIDATION)
+ #include <valgrind/memcheck.h>
+ #endif
+@@ -87,6 +88,22 @@
+ /*
+  * Structure of keys
+  */
++// External declaration for the GPU Library
++/* Wrapper functions to match the callback signature */
++
++/* Wrapper functions */
++static void wrapper_pause(void) { 
++    ASYNC_pause_job(); 
++}
++
++/* * 'ASYNC_wake' is internal/hidden and causes linker errors.
++ * The runtime will simply rely on the condition variable or blocking.
++ */
++static void* wrapper_get_job(void) { 
++    return (void*)ASYNC_get_current_job(); 
++}
++
++static int cupqc_callbacks_registered = 0;
+ typedef struct ossl_ml_kem_scalar_st {
+     /* On every function entry and exit, 0 <= c[i] < ML_KEM_PRIME. */
+     uint16_t c[ML_KEM_DEGREE];
+@@ -1798,11 +1815,14 @@
+     EVP_MD_CTX_free(mdctx);
+     return ret;
+ }
+-
+ /*
+  * Generate a new keypair, either from the saved seed (when non-null), or from
+  * the RNG.
+  */
++/* --- ADD THIS --- */
++/* * STANDARD OPENSSL 3.5 ML-KEM KEYGEN
++ * (CPU-Only, Safe, Correct)
++ */
+ int ossl_ml_kem_genkey(uint8_t *pubenc, size_t publen, ML_KEM_KEY *key)
+ {
+     uint8_t seed[ML_KEM_SEED_BYTES];
+@@ -1819,6 +1839,7 @@
+     if (pubenc != NULL && publen != vinfo->pubkey_bytes)
+         return 0;
+ 
++    /* 1. Generate or retrieve the random seed */
+     if (ossl_ml_kem_have_seed(key)) {
+         if (!ossl_ml_kem_encode_seed(seed, sizeof(seed), key))
+             return 0;
+@@ -1830,32 +1851,30 @@
+ 
+     if ((mdctx = EVP_MD_CTX_new()) == NULL)
+         return 0;
+-
+-    /*
++     /*
+      * Data derived from (d, z) defaults secret, and to avoid side-channel
+      * leaks should not influence control flow.
+      */
+     CONSTTIME_SECRET(seed, ML_KEM_SEED_BYTES);
+ 
+-    if (add_storage(OPENSSL_malloc(vinfo->prvalloc), 1, key))
++   if (add_storage(OPENSSL_malloc(vinfo->prvalloc), 1, key))
+         ret = genkey(seed, mdctx, pubenc, key);
++    
+     OPENSSL_cleanse(seed, sizeof(seed));
+-
+-    /* Declassify secret inputs and derived outputs before returning control */
+-    CONSTTIME_DECLASSIFY(seed, ML_KEM_SEED_BYTES);
++ /* Declassify secret inputs and derived outputs before returning control */   
++ CONSTTIME_DECLASSIFY(seed, ML_KEM_SEED_BYTES);
+ 
+     EVP_MD_CTX_free(mdctx);
++    
+     if (!ret) {
+         ossl_ml_kem_key_reset(key);
+         return 0;
+     }
+ 
+-    /* The public components are already declassified */
+     CONSTTIME_DECLASSIFY(key->s, vinfo->rank * sizeof(scalar));
+     CONSTTIME_DECLASSIFY(key->z, 2 * ML_KEM_RANDOM_BYTES);
+     return 1;
+ }
+-
+ /*
+  * FIPS 203, Section 6.2, Algorithm 17: ML-KEM.Encaps_internal
+  * This is the deterministic version with randomness supplied externally.
+@@ -1919,6 +1938,43 @@
+                            const ML_KEM_KEY *key)
+ {
+     uint8_t r[ML_KEM_RANDOM_BYTES];
++    uint8_t pub_encoded[1184];
++
++    if (key == NULL) return 0;
++
++    // 1. Generate Randomness (Standard OpenSSL)
++    if (RAND_bytes_ex(key->libctx, r, ML_KEM_RANDOM_BYTES,
++                      key->vinfo->secbits) < 1)
++        return 0;
++
++    const char *env = getenv("ENABLE_CUPQC");
++
++    if (env && strcmp(env, "1") == 0) {
++        
++        // Register callbacks ONCE (Lazy Init)
++        if (!cupqc_callbacks_registered) {
++            cupqc_set_callbacks(wrapper_pause,NULL, wrapper_get_job);
++            cupqc_callbacks_registered = 1;
++        }
++
++        // Serialize Key
++        ossl_ml_kem_encode_public_key(pub_encoded, 1184, key);
++
++        // Submit to Runtime (Runtime handles waiting/pausing)
++        if (cupqc_submit_encap_job(pub_encoded, r, ctext, shared_secret) == 1) {
++            return 1;
++        }
++    }
++
++    // Fallback
++    return ossl_ml_kem_encap_seed(ctext, clen, shared_secret, slen,
++                                  r, sizeof(r), key);
++}
++/* int ossl_ml_kem_encap_rand(uint8_t *ctext, size_t clen,
++                           uint8_t *shared_secret, size_t slen,
++                           const ML_KEM_KEY *key)
++{
++    uint8_t r[ML_KEM_RANDOM_BYTES];
+ 
+     if (key == NULL)
+         return 0;
+@@ -1930,7 +1986,7 @@
+     return ossl_ml_kem_encap_seed(ctext, clen, shared_secret, slen,
+                                   r, sizeof(r), key);
+ }
+-
++*/
+ int ossl_ml_kem_decap(uint8_t *shared_secret, size_t slen,
+                       const uint8_t *ctext, size_t clen,
+                       const ML_KEM_KEY *key)
+--- upstream/openssl/crypto/ml_kem/cupqc_batch.h	2026-02-02 12:57:21.437223877 +0000
++++ openssl-openssl-3.5.0/crypto/ml_kem/cupqc_batch.h	2026-02-14 04:57:49.888240721 +0000
+@@ -1,34 +1,34 @@
+ #ifndef CUPQC_BATCH_H
+ #define CUPQC_BATCH_H
+ 
+-#include <openssl/async.h>
++#include <stdint.h>
+ 
+-#define MLKEM_768_PK_BYTES 1184 // Standard size#include <pthread.h>
+-
+-// 1. Configurable Batch Size (This is what you will change to Benchmark 50 vs 100)
+-#define CUPQC_BATCH_SIZE 512
++#ifdef __cplusplus
++extern "C" {
++#endif
+ 
+-// 2. The "Ticket" structure for one TLS request
+-typedef struct {
+-    int id;
+-
+-    unsigned char pub_key_storage[1184];
+-    unsigned char *randomness_in;    
+-    unsigned char *shared_secret_out;// Pointer to output buffer
+-    unsigned char *ciphertext_out;   // Pointer to output buffer
+-    
+-    ASYNC_JOB *job;                  // The OpenSSL Job to wake up later
+-    ASYNC_WAIT_CTX *wait_ctx;        // Context to signal the wake-up
+-    int status;                      // 0 = Waiting, 1 = Completed
+-} cupqc_job_t;
+-
+-// 3. The "Waiting Room" (Queue)
+-typedef struct {
+-    cupqc_job_t jobs[CUPQC_BATCH_SIZE]; // Array of slots
+-    int count;                          // Current number of people waiting
+-    pthread_mutex_t lock;               // Thread safety lock
+-    pthread_cond_t cond;                // Signal to wake up the GPU Manager
+-    int shutdown;                       // Flag to stop the system
+-} cupqc_batch_queue_t;
++/* * API: Submit an encapsulation job.
++ * The runtime handles all batching, threading, and GPU offloading internally.
++ */
++int cupqc_submit_encap_job(
++    uint8_t *public_key,
++    uint8_t *randomness,
++    uint8_t *ciphertext_out,
++    uint8_t *shared_secret_out
++);
++
++/*
++ * API: Register OpenSSL async callbacks.
++ * Allows the runtime to pause/wake OpenSSL jobs during GPU wait times.
++ */
++void cupqc_set_callbacks(
++    void (*pause)(void),
++    void (*wake)(void *),
++    void *(*get_job)(void)
++);
+ 
++#ifdef __cplusplus
++}
+ #endif
++
++#endif /* CUPQC_BATCH_H */
