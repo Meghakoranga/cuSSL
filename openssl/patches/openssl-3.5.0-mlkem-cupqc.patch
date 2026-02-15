@@ -135,45 +135,18 @@
  int ossl_ml_kem_decap(uint8_t *shared_secret, size_t slen,
                        const uint8_t *ctext, size_t clen,
                        const ML_KEM_KEY *key)
---- upstream/openssl/crypto/ml_kem/cupqc_batch.h	2026-02-02 12:57:21.437223877 +0000
+--- /dev/null	2026-02-15 13:18:51.577000071 +0000
 +++ openssl-openssl-3.5.0/crypto/ml_kem/cupqc_batch.h	2026-02-14 04:57:49.888240721 +0000
-@@ -1,34 +1,34 @@
- #ifndef CUPQC_BATCH_H
- #define CUPQC_BATCH_H
- 
--#include <openssl/async.h>
+@@ -0,0 +1,34 @@
++#ifndef CUPQC_BATCH_H
++#define CUPQC_BATCH_H
++
 +#include <stdint.h>
- 
--#define MLKEM_768_PK_BYTES 1184 // Standard size#include <pthread.h>
--
--// 1. Configurable Batch Size (This is what you will change to Benchmark 50 vs 100)
--#define CUPQC_BATCH_SIZE 512
++
 +#ifdef __cplusplus
 +extern "C" {
 +#endif
- 
--// 2. The "Ticket" structure for one TLS request
--typedef struct {
--    int id;
--
--    unsigned char pub_key_storage[1184];
--    unsigned char *randomness_in;    
--    unsigned char *shared_secret_out;// Pointer to output buffer
--    unsigned char *ciphertext_out;   // Pointer to output buffer
--    
--    ASYNC_JOB *job;                  // The OpenSSL Job to wake up later
--    ASYNC_WAIT_CTX *wait_ctx;        // Context to signal the wake-up
--    int status;                      // 0 = Waiting, 1 = Completed
--} cupqc_job_t;
--
--// 3. The "Waiting Room" (Queue)
--typedef struct {
--    cupqc_job_t jobs[CUPQC_BATCH_SIZE]; // Array of slots
--    int count;                          // Current number of people waiting
--    pthread_mutex_t lock;               // Thread safety lock
--    pthread_cond_t cond;                // Signal to wake up the GPU Manager
--    int shutdown;                       // Flag to stop the system
--} cupqc_batch_queue_t;
++
 +/* * API: Submit an encapsulation job.
 + * The runtime handles all batching, threading, and GPU offloading internally.
 + */
@@ -193,9 +166,9 @@
 +    void (*wake)(void *),
 +    void *(*get_job)(void)
 +);
- 
++
 +#ifdef __cplusplus
 +}
- #endif
++#endif
 +
 +#endif /* CUPQC_BATCH_H */
