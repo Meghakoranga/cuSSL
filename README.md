@@ -165,26 +165,19 @@ OpenSSL will fall back to CPU implementation automatically.
 
 ---
 
-##  Performance Characteristics
+## Performance & Scaling
 
-GPU acceleration improves throughput significantly when batching is enabled.
+This engine offloads the heavy post-quantum math to the GPU. However, overall throughput depends heavily on the web server's architecture.
 
-Tradeoffs:
+### Current Benchmark (Standard Nginx)
+* **Rate:** ~500 Handshakes/Second
+* **Architecture Limit:** Standard Nginx uses a multi-processing model (e.g., 32 isolated worker processes). Because memory is not shared between these workers, the engine's internal batch queue cannot easily aggregate hundreds of connections at once. To prevent deadlocks, the GPU wake threshold is set to `1`, meaning the GPU processes very small batches, causing high CPU overhead from frequent kernel launches.
 
-Latency:
-* Higher for single requests (PCIe transfer overhead)
+### How to Scale to 2,000+ HS/s
+To fully saturate the GPU and achieve maximum throughput, the engine needs to fill its 512-slot batch queue. This can be achieved through two potential upgrades:
 
-Throughput:
-* Much higher under concurrent load
-* Optimized for multi-connection TLS servers
-
-Designed for:
-
-* TLS termination servers
-* PQC-enabled secure infrastructure
-* GPU-accelerated cryptographic workloads
-
----
+1. **Async-Enabled Server:** Use a web server that supports OpenSSL's asynchronous features (like Intel's Async Nginx). This allows a *single* worker process to handle thousands of concurrent connections, naturally filling a single, massive GPU queue without blocking.
+2. **Background Flush Timer:** Implement a POSIX timer thread inside `cupqc_runtime.c` that forces a queue flush every few milliseconds, ensuring that "leftover" connections do not deadlock when using larger batch thresholds across multiple Nginx workers.
 
 ##  Security and Compatibility
 
