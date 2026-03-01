@@ -150,7 +150,7 @@ int cupqc_submit_encap_job(uint8_t *public_key,
 
     global_queue.count++;
     
-    if (global_queue.count >= 32) { 
+    if (global_queue.count >= 1) { 
         pthread_cond_signal(&global_queue.cond);
     }
 
