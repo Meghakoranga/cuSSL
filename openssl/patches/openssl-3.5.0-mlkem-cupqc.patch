@@ -1,18 +1,20 @@
 --- upstream/openssl/crypto/ml_kem/ml_kem.c	2026-02-02 12:57:21.435417013 +0000
-+++ openssl-openssl-3.5.0/crypto/ml_kem/ml_kem.c	2026-05-25 13:00:48.252684782 +0000
-@@ -13,7 +13,10 @@
++++ openssl-openssl-3.5.0/crypto/ml_kem/ml_kem.c	2026-07-17 11:32:36.092648070 +0000
+@@ -13,7 +13,12 @@
  #include "internal/common.h"
  #include "internal/constant_time.h"
  #include "internal/sha3.h"
 -
 +#include <openssl/crypto.h>
 +#include <openssl/async.h>
++#include <sys/eventfd.h>
++#include <unistd.h>
 +#include "internal/thread_once.h"
 +#include "cupqc_batch.h"
  #if defined(OPENSSL_CONSTANT_TIME_VALIDATION)
  #include <valgrind/memcheck.h>
  #endif
-@@ -87,6 +90,44 @@
+@@ -87,6 +92,130 @@
  /*
   * Structure of keys
   */
@@ -20,44 +22,130 @@
 +/* Wrapper functions to match the callback signature */
 +
 +/* Wrapper functions */
-+static void wrapper_pause(void)
-+  {
-+    ASYNC_pause_job();
-+  }
-+
-+/* * 'ASYNC_wake' is internal/hidden and causes linker errors.
-+ * The runtime will simply rely on the condition variable or blocking.
++/*
++ * Unique tag used to identify our fd registration on a job's
++ * ASYNC_WAIT_CTX. The address of this static variable is guaranteed
++ * unique and stable for the lifetime of the process.
 + */
++static int cupqc_async_key;
++
++/*
++ * Called by OpenSSL's async machinery (indirectly, via
++ * ASYNC_WAIT_CTX_set_wait_fd) when the wait ctx is torn down, to make
++ * sure we don't leak the eventfd.
++ */
++static void cupqc_wait_fd_cleanup(ASYNC_WAIT_CTX *ctx, const void *key,
++                                  OSSL_ASYNC_FD fd, void *custom_data)
++{
++    if (fd >= 0)
++        close(fd);
++}
++
 +static void* wrapper_get_job(void)
-+ {
++{
 +    return (void*)ASYNC_get_current_job();
 +}
 +
-+static void wrapper_wake(void *job_ptr) {
-+    ASYNC_JOB *job = (ASYNC_JOB *)job_ptr;
-+    if (job != NULL) {
-+        ASYNC_WAIT_CTX *ctx = ASYNC_get_wait_ctx(job);
-+        if (ctx != NULL) {
-+            ASYNC_callback_fn cb;
-+            void *cb_args;
-+            /* Retrieve the registered async callback from the OpenSSL context */
-+            if (ASYNC_WAIT_CTX_get_callback(ctx, &cb, &cb_args) && cb != NULL) {
-+                /* Fire the callback to wake up the OpenSSL state machine */
-+                (*cb)(cb_args);
-+            }
++/*
++ * Prepares the current async job for a pause by ensuring it has a real,
++ * fd-based wait mechanism registered on its ASYNC_WAIT_CTX -
++ * openssl speed (and any other caller using ASYNC_WAIT_CTX_get_all_fds
++ * + select()/poll()) needs an actual fd to watch; without one it ends
++ * up watching an uninitialised/default fd (0) that never becomes
++ * ready, and hangs forever.
++ */
++static void wrapper_prepare_wait(void)
++{
++    ASYNC_JOB *job = ASYNC_get_current_job();
++    ASYNC_WAIT_CTX *ctx = (job != NULL) ? ASYNC_get_wait_ctx(job) : NULL;
++    OSSL_ASYNC_FD efd;
++    void *existing_data = NULL;
++
++    if (ctx == NULL)
++        return;
++
++    if (!ASYNC_WAIT_CTX_get_fd(ctx, &cupqc_async_key, &efd, &existing_data)
++        || efd < 0) {
++        efd = eventfd(0, EFD_NONBLOCK);
++        if (efd >= 0) {
++            ASYNC_WAIT_CTX_set_wait_fd(ctx, &cupqc_async_key, efd,
++                                      NULL, cupqc_wait_fd_cleanup);
 +        }
++    }
++}
++
++/*
++ * Pauses the current async job and drains any wake notification that
++ * arrives on the registered eventfd.
++ */
++static void wrapper_pause(void)
++{
++    ASYNC_JOB *job = ASYNC_get_current_job();
++    ASYNC_WAIT_CTX *ctx = (job != NULL) ? ASYNC_get_wait_ctx(job) : NULL;
++    OSSL_ASYNC_FD efd = (OSSL_ASYNC_FD)-1;
++    void *existing_data = NULL;
++
++    if (ctx != NULL)
++        ASYNC_WAIT_CTX_get_fd(ctx, &cupqc_async_key, &efd, &existing_data);
++
++    ASYNC_pause_job();
++
++    /*
++     * We've been resumed - drain the eventfd so it doesn't read as
++     * "ready" again on our *next* pause/resume cycle.
++     */
++    if (efd >= 0) {
++        uint64_t drained;
++        while (read(efd, &drained, sizeof(drained)) > 0) {
++            /* keep draining in case more than one wake was queued */
++        }
++    }
++}
++
++/*
++ * Called from the GPU worker thread (cupqc_runtime.c) once a batch's
++ * results are ready. Signals BOTH styles of OpenSSL async waiter:
++ * fd-based (what openssl speed / most callers use) and callback-based
++ * (kept for compatibility with any caller that registers one instead).
++ */
++static void wrapper_wake(void *job_ptr)
++{
++    ASYNC_JOB *job = (ASYNC_JOB *)job_ptr;
++    ASYNC_WAIT_CTX *ctx;
++    OSSL_ASYNC_FD fd;
++    void *custom_data = NULL;
++
++    if (job == NULL)
++        return;
++    ctx = ASYNC_get_wait_ctx(job);
++    if (ctx == NULL)
++        return;
++
++    /* Fd-based wake - this is the one that was previously missing. */
++    if (ASYNC_WAIT_CTX_get_fd(ctx, &cupqc_async_key, &fd, &custom_data)
++        && fd >= 0) {
++        uint64_t one = 1;
++        ssize_t n = write(fd, &one, sizeof(one));
++        (void)n; /* EAGAIN here just means it's already signalled - fine */
++    }
++
++    /* Callback-based wake - kept for any caller using that model instead. */
++    {
++        ASYNC_callback_fn cb;
++        void *cb_args;
++        if (ASYNC_WAIT_CTX_get_callback(ctx, &cb, &cb_args) && cb != NULL)
++            (*cb)(cb_args);
 +    }
 +}
 +static CRYPTO_ONCE cupqc_init_callbacks = CRYPTO_ONCE_STATIC_INIT;
 +DEFINE_RUN_ONCE_STATIC(do_cupqc_cb_init) {
-+    /*  passing wrapper_wake here instead of NULL! */
-+    cupqc_set_callbacks(wrapper_pause, wrapper_wake, wrapper_get_job);
++    cupqc_set_callbacks(wrapper_prepare_wait, wrapper_pause, wrapper_wake, wrapper_get_job);
 +    return 1;
 +}
  typedef struct ossl_ml_kem_scalar_st {
      /* On every function entry and exit, 0 <= c[i] < ML_KEM_PRIME. */
      uint16_t c[ML_KEM_DEGREE];
-@@ -1798,11 +1839,11 @@
+@@ -1798,11 +1927,11 @@
      EVP_MD_CTX_free(mdctx);
      return ret;
  }
@@ -70,7 +158,7 @@
  int ossl_ml_kem_genkey(uint8_t *pubenc, size_t publen, ML_KEM_KEY *key)
  {
      uint8_t seed[ML_KEM_SEED_BYTES];
-@@ -1830,7 +1871,6 @@
+@@ -1830,7 +1959,6 @@
  
      if ((mdctx = EVP_MD_CTX_new()) == NULL)
          return 0;
@@ -78,7 +166,7 @@
      /*
       * Data derived from (d, z) defaults secret, and to avoid side-channel
       * leaks should not influence control flow.
-@@ -1839,17 +1879,16 @@
+@@ -1839,17 +1967,16 @@
  
      if (add_storage(OPENSSL_malloc(vinfo->prvalloc), 1, key))
          ret = genkey(seed, mdctx, pubenc, key);
@@ -100,7 +188,7 @@
      /* The public components are already declassified */
      CONSTTIME_DECLASSIFY(key->s, vinfo->rank * sizeof(scalar));
      CONSTTIME_DECLASSIFY(key->z, 2 * ML_KEM_RANDOM_BYTES);
-@@ -1919,18 +1958,34 @@
+@@ -1919,18 +2046,34 @@
                             const ML_KEM_KEY *key)
  {
      uint8_t r[ML_KEM_RANDOM_BYTES];
@@ -110,7 +198,7 @@
 -        return 0;
 +    if (key == NULL) return 0;
  
-+    // 1. Generate Randomness (Standard OpenSSL)
++    //  Generate Randomness (Standard OpenSSL)
      if (RAND_bytes_ex(key->libctx, r, ML_KEM_RANDOM_BYTES,
                        key->vinfo->secbits) < 1)
          return 0;
@@ -138,9 +226,9 @@
  int ossl_ml_kem_decap(uint8_t *shared_secret, size_t slen,
                        const uint8_t *ctext, size_t clen,
                        const ML_KEM_KEY *key)
---- /dev/null	2026-05-25 12:50:01.565000071 +0000
-+++ openssl-openssl-3.5.0/crypto/ml_kem/cupqc_batch.h	2026-05-25 12:59:03.566259628 +0000
-@@ -0,0 +1,34 @@
+--- /dev/null	2026-07-17 11:09:42.576103502 +0000
++++ openssl-openssl-3.5.0/crypto/ml_kem/cupqc_batch.h	2026-07-14 11:22:13.961087833 +0000
+@@ -0,0 +1,35 @@
 +#ifndef CUPQC_BATCH_H
 +#define CUPQC_BATCH_H
 +
@@ -165,6 +253,7 @@
 + * Allows the runtime to pause/wake OpenSSL jobs during GPU wait times.
 + */
 +void cupqc_set_callbacks(
++    void (*prepare_wait)(void),
 +    void (*pause)(void),
 +    void (*wake)(void *),
 +    void *(*get_job)(void)

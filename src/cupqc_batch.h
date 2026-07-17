@@ -22,6 +22,7 @@ int cupqc_submit_encap_job(
  * Allows the runtime to pause/wake OpenSSL jobs during GPU wait times.
  */
 void cupqc_set_callbacks(
+    void (*prepare_wait)(void),
     void (*pause)(void),
     void (*wake)(void *),
     void *(*get_job)(void)
@@ -31,4 +32,4 @@ void cupqc_set_callbacks(
 }
 #endif
 
-#endif /* CUPQC_BATCH_H */
+#endif 
