@@ -1,230 +1,168 @@
-# cuSSL: GPU-Accelerated ML-KEM-768 Integration for OpenSSL 3.5
+# cuSSL
 
-**Hardware-Accelerated Post-Quantum Cryptography using NVIDIA cuPQC and CUDA**
+**GPU-accelerated ML-KEM-768 for OpenSSL 3.5** — offloads post-quantum key encapsulation to NVIDIA GPUs via a CUDA runtime built on NVIDIA's cuPQC SDK.
 
-cuSSL is a high-performance runtime and backend that offloads **ML-KEM-768** Key Encapsulation operations from OpenSSL 3.5 to NVIDIA GPUs. It integrates directly into the OpenSSL cryptographic core and enables high-throughput TLS 1.3 Post-Quantum handshakes.
-
-cuSSL implements a **Split-Stack Architecture**, cleanly separating the OpenSSL cryptographic core (CPU/C) from the GPU execution backend (CUDA/C++), ensuring ABI stability, thread safety, and memory isolation.
+cuSSL patches OpenSSL 3.5 to offload ML-KEM-768 (the post-quantum key exchange used in TLS 1.3) to a GPU, with no changes to OpenSSL's public API and an automatic fallback to CPU execution whenever GPU offload is disabled. It uses a split-stack architecture — OpenSSL (C) is kept fully separate from the CUDA backend (C++) — for ABI stability, thread safety, and memory isolation.
 
 ---
 
-##  Features
+## Table of Contents
 
-* GPU-accelerated ML-KEM-768 encapsulation using NVIDIA cuPQC
-* Asynchronous batching runtime (up to 512 concurrent operations)
-* Direct integration into OpenSSL 3.5 cryptographic core
-* Thread-safe job queue and runtime scheduler
-* Secure memory isolation between OpenSSL and GPU runtime
-* Automatic CPU fallback when GPU offload is disabled
-* Clean patch-based integration (no OpenSSL source redistribution)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Requirements](#requirements)
+- [Build](#build)
+- [Usage](#usage)
+- [Benchmarks](#benchmarks)
+- [Repository Structure](#repository-structure)
+- [Roadmap](#roadmap)
+- [Security & Compatibility](#security--compatibility)
+- [License](#license)
+
+---
+
+## Features
+
+- GPU-accelerated ML-KEM-768 encapsulation via NVIDIA cuPQC
+- Async batching runtime, stress-tested up to 512 concurrent operations
+- Patch-based OpenSSL 3.5 integration — no public API changes, no OpenSSL source redistributed
+- Thread-safe job queue and runtime scheduler
+- Automatic CPU fallback when GPU offload is disabled
 
 ---
 
 ## Architecture
 
-cuSSL operates in three layers:
+Three layers, each independently testable:
 
-### 1. OpenSSL Integration Layer (Client)
-
-**File:** `crypto/ml_kem/ml_kem.c` (patched)
-
-Responsibilities:
-
-* Intercepts ML-KEM encapsulation requests
-* Submits jobs via cuSSL runtime API
-* Uses OpenSSL Async Job framework (`ASYNC_pause_job`)
-* Maintains full compatibility with OpenSSL execution model
+| Layer | File | Role |
+|---|---|---|
+| OpenSSL Integration | `crypto/ml_kem/ml_kem.c` (patched) | Intercepts ML-KEM-768 requests, submits jobs to the runtime, falls back to CPU when GPU offload is off |
+| cuSSL Runtime | `src/cupqc_runtime.c` | Thread-safe 512-slot batching queue, request scheduling, worker-thread coordination |
+| CUDA Backend | `src/cupqc_shim.cu` | Runs batched `cupqc::ML_KEM_768` kernels, manages persistent GPU buffers and a reused CUDA stream |
 
 ---
 
-### 2. cuSSL Runtime Layer (Manager)
+## Requirements
 
-**File:** `src/cupqc_runtime.c`
+**Hardware:** NVIDIA GPU, Turing/Ampere/Ada or newer, Compute Capability ≥ 7.5
 
-Responsibilities:
-
-* Thread-safe batching queue
-* Job scheduling and worker thread management
-* Memory isolation between OpenSSL and CUDA
-* Async job coordination
-
-This layer acts as the bridge between OpenSSL and GPU backend.
+**Software:** Linux (Ubuntu 20.04/22.04), OpenSSL 3.5.0 source, CUDA Toolkit 12+, NVIDIA cuPQC SDK, GCC 9+, NVCC
 
 ---
 
-### 3. CUDA Backend Layer (Worker)
-
-**File:** `src/cupqc_shim.cu`
-
-Responsibilities:
-
-* Executes batched ML-KEM-768 encapsulation
-* Launches cuPQC CUDA kernels
-* Manages persistent GPU memory buffers
-* Performs host/device memory transfers
-
-Uses: cupqc::ML_KEM_768 from NVIDIA cuPQC SDK.
-
----
-
-##  Prerequisites
-
-Hardware:
-
-* NVIDIA GPU (Turing / Ampere / Ada or newer)
-* Compute Capability ≥ 7.5
-
-Software:
-
-* Linux (Ubuntu 20.04 / 22.04 recommended)
-* OpenSSL 3.5.0 source
-* NVIDIA CUDA Toolkit (12+)
-* NVIDIA cuPQC SDK
-* GCC 9+
-* NVCC compiler
-
----
-### Build Instructions
-
-**1. Set Environment Variables**
+## Build
 
 ```bash
 export CUPQC_HOME=/path/to/cupqc_sdk
 export OPENSSL_ROOT=/path/to/openssl-3.5.0
 
-```
-
-**2. Compile cuSSL Runtime and CUDA Backend**
-
-*Note: cuPQC is a pre-compiled, Link-Time Optimized (LTO) closed-source SDK. The build chain requires strict Relocatable Device Code 
-(`-rdc=true`) and LTO flags. We dynamically locate missing internal headers to satisfy C++ standard requirements.*
-
-```bash
-# Locate deeply buried internal SDK headers
+# cuPQC ships as a pre-compiled, LTO-linked SDK — the build needs RDC + LTO
+# flags and an explicit device-link step for symbol resolution.
 export MISSING_INC_PATH=$(find ${CUPQC_HOME} -name "database.hpp" -exec dirname {} \; | head -n 1)
 
-# Compile C runtime:
 gcc -c src/cupqc_runtime.c -o cupqc_runtime.o -fPIC \
-    -I${OPENSSL_ROOT}/include \
-    -I${OPENSSL_ROOT}/crypto/ml_kem
+    -I${OPENSSL_ROOT}/include -I${OPENSSL_ROOT}/crypto/ml_kem
 
-# Compile CUDA backend (Explicit C++17 and LTO):
 nvcc -c src/cupqc_shim.cu -o cupqc_shim.o \
     -rdc=true -dlto -std=c++17 -arch=sm_75 \
-    -I${CUPQC_HOME}/include \
-    -I${CUPQC_HOME}/include/cupqc/detail \
-    -I$MISSING_INC_PATH \
+    -I${CUPQC_HOME}/include -I${CUPQC_HOME}/include/cupqc/detail -I$MISSING_INC_PATH \
     -Xcompiler -fPIC
 
-# Device link (Crucial: Must link the library here for RDC resolution):
 nvcc -arch=sm_75 -dlink cupqc_shim.o -o cupqc_shim_dlink.o \
-    -rdc=true -dlto \
-    -L${CUPQC_HOME}/lib -lcupqc-pk \
-    -Xcompiler -fPIC
+    -rdc=true -dlto -L${CUPQC_HOME}/lib -lcupqc-pk -Xcompiler -fPIC
 
-# Final shared library link:
 g++ -shared -o libcussl.so \
     cupqc_runtime.o cupqc_shim.o cupqc_shim_dlink.o \
-    -L${CUPQC_HOME}/lib -lcupqc-pk \
-    -L/usr/local/cuda/lib64 -lcudart -lpthread
-
+    -L${CUPQC_HOME}/lib -lcupqc-pk -L/usr/local/cuda/lib64 -lcudart -lpthread
 ```
 
-**3. Apply OpenSSL Patch**
-From your OpenSSL root directory:
+Apply the patch and rebuild OpenSSL:
 
 ```bash
+cd $OPENSSL_ROOT
 patch -p1 < /path/to/cuSSL/openssl/patches/openssl-3.5.0-mlkem-cupqc.patch
 make -j$(nproc)
-
 ```
+
 ---
 
-### Usage
-
-**1. Start the Hardware Daemon (Required for Nginx/Multi-Process)**
-
-To maximize throughput and prevent PCIe context-switching penalties, start the NVIDIA Multi-Process Service before running the web server:
+## Usage
 
 ```bash
+# Multi-process servers (Nginx, etc.): start MPS before the server, so worker
+# processes share the GPU instead of context-switching between them.
 sudo nvidia-cuda-mps-control -d
 
-```
-
-**2. Enable the Engine and Run**
-
-```bash
+# Enable GPU offload
 export ENABLE_CUPQC=1
 openssl s_server -accept 4433 -cert cert.pem -key key.pem -tls1_3 -groups mlkem768
 
-```
+# Verify offload
+nvitop   # or nvidia-smi — check GPU utilization during a handshake
 
-**3. Verify Offload**
-
-Use `nvitop` or `nvidia-smi` to verify GPU utilization during active handshakes.
-
-To disable GPU offload and fallback to standard CPU execution, simply:
-
-```bash
+# Disable GPU offload, fall back to CPU
 unset ENABLE_CUPQC
 ```
----
-
-### Performance & Scaling
-
-This engine offloads post-quantum math to the GPU. However, ML-KEM-768 is mathematically "lightweight" (Lattice-based cryptography), which shifts the performance bottleneck from raw compute to **PCIe transfer latency**.
-
-#### Current Benchmark (Standard Nginx + NVIDIA MPS)
-
-* **Rate:** ~836 Handshakes/Second
-* **The PCIe Latency Paradox:** The GPU executes the ML-KEM math in ~2 microseconds, but transferring the 1,184-byte public keys across the PCIe bus takes ~10-15 microseconds per direction.
-* **The MPS Solution:** Standard Nginx uses a synchronous multi-processing model (e.g., 32 isolated worker processes), meaning it inherently struggles to build large batches. To solve this, the engine is designed to run concurrently with the **NVIDIA MPS Daemon**. MPS intercepts the isolated worker threads and fuses them into optimized VRAM batches, preventing context-thrashing and maximizing throughput for synchronous web servers.
-
-#### Roadmap to 2,000+ Handshakes/Sec
-
-To fully saturate the GPU compute capacity and break past the PCIe bottleneck, the engine requires environment upgrades to build massive, single-transaction batches:
-
-1. **Async-Enabled Server:** Standard Nginx blocks on every connection. Migrating this OpenSSL engine into a web server that natively supports OpenSSL's asynchronous polling (like Envoy, HAProxy, or Intel's Async Nginx) allows a single worker process to handle thousands of concurrent connections. This naturally fills the engine's 512-slot GPU queue without blocking, mathematically offsetting the PCIe transfer penalty.
-2. **PCIe Generation Upgrades:** The current ceiling was benchmarked on a Tesla T4 (PCIe Gen 3). Deploying this engine on PCIe Gen 4 or Gen 5 hardware will physically double or quadruple the transfer bandwidth of the lattice keys, linearly increasing the ops/sec ceiling.
 
 ---
 
-##  Security and Compatibility
+## Benchmarks
 
-cuSSL:
+Measured with two tools: the official `openssl speed -kem-algorithms ML-KEM-768` (raw encapsulation throughput) and `benchmark_tls` (this repo's own client, full TLS 1.3 handshakes against live Nginx).
 
-* Preserves OpenSSL security model
-* Does not modify public OpenSSL APIs
-* Uses isolated runtime
-* Supports CPU fallback
+| Kernel-level (`openssl speed`) | Throughput | vs. CPU |
+|---|---|---|
+| CPU (`-multi 4`) | 82,620 ops/sec | 1.0x |
+| GPU, 1 process | 208,388 ops/sec | 2.5x |
+| GPU, 4 processes + MPS | **265,974 ops/sec** | **3.2x** |
 
-Patch-based integration ensures maintainability across OpenSSL versions.
+| Full handshake (`benchmark_tls`, live Nginx) | Throughput | vs. CPU |
+|---|---|---|
+| CPU-only | **1,523 hs/sec** | 1.0x |
+| GPU, no MPS | 1,280 hs/sec | 0.84x |
+| GPU + MPS | 1,362 hs/sec | 0.89x |
+
+GPU wins decisively at the raw cryptographic kernel (3.2x). It does not yet win at the full-handshake level (~12% behind CPU) — a full handshake also costs a TCP handshake, TLS record processing, and an RSA certificate signature, none of which touch the GPU, and Nginx currently falls back to blocking one worker per request rather than batching (see [Roadmap](#roadmap)).
+
+---
+
+## Repository Structure
+
+```
+cuSSL/
+├── benchmarks/
+│   └── benchmark_tls.c          # Full TLS 1.3 handshake benchmark
+├── include/cussl/
+│   └── pqc.h                    # Public header
+├── openssl/patches/
+│   └── openssl-3.5.0-mlkem-cupqc.patch
+├── src/
+│   ├── cupqc_batch.h            # Job submission / callback API
+│   ├── cupqc_runtime.c          # Runtime scheduler
+│   └── cupqc_shim.cu            # CUDA backend
+├── LICENSE
+└── README.md
+```
 
 ---
 
-##  Licensing
+## Roadmap
 
-This repository contains only integration code.
-
-It does NOT include:
-
-* OpenSSL source code
-* NVIDIA cuPQC SDK
-* CUDA Toolkit
-
-Users must obtain those separately under their respective licenses.
+1. Wire cuSSL as a proper OpenSSL ENGINE so servers can use true async-job batching instead of today's one-request-per-worker blocking fallback
+2. Async-native server deployment (Envoy, HAProxy) to keep the GPU batching queue full without blocking
+3. PCIe Gen 4/5 hardware to reduce transfer latency (current results: Tesla T4, PCIe Gen 3)
+4. Expanded PQC algorithm and hybrid-TLS support
+5. Published technical report on the batching architecture and results
 
 ---
-### Project Status
 
-The engine is fully functional, architecturally stable, and ready for production-grade testing. It successfully performs hardware-offloaded ML-KEM-768 key encapsulation for standard OpenSSL TLS 1.3 connections under massive concurrency.
+## Security & Compatibility
 
-Core achievements include:
+Preserves OpenSSL's security model and public API. CUDA and OS-specific synchronization details are isolated from OpenSSL. CPU fallback is always available. Patch-based integration means no OpenSSL fork to maintain across versions.
 
-* **Correctness:** Validated bit-exact key exchange and successful handshake completion across 10,000+ request floods.
-* **Architecture:** Strict separation of OpenSSL API and GPU runtime for full library compliance. The C++ shim utilizes `std::call_once` and POSIX concurrency primitives to guarantee strict thread safety and zero memory leaks.
-* **Hardware Orchestration:** Fully integrated with NVIDIA Multi-Process Service (MPS) to allow multi-process web servers (like Nginx) to transparently batch synchronous requests across the PCIe bus.
+---
 
+## License
 
-
-
+This repository contains integration code only. It does **not** include OpenSSL source, the NVIDIA cuPQC SDK, or the CUDA Toolkit — each must be obtained separately under its own license.
