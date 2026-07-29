@@ -4,7 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdexcept>
-#include <mutex> /* Required for std::call_once */
+#include <mutex>
+#include <thread>
+#include <chrono>
+#include <atomic>
 
 using namespace cupqc;
 
@@ -17,8 +20,28 @@ using namespace cupqc;
         } \
     } while(0)
 
-using Encaps768 = decltype(ML_KEM_768{} + Function<function::Encaps>() + Block() + BlockDim<128>());
+#define CUDA_CHECK_RETRY(call) \
+    do { \
+        cudaError_t err; \
+        int attempts = 0; \
+        const int max_attempts = 60; \
+        for (;;) { \
+            err = call; \
+            if (err == cudaSuccess) break; \
+            attempts++; \
+            fprintf(stderr, "[cussl] CUDA init retry at %s:%d - %s (attempt %d/%d)\n", \
+                    __FILE__, __LINE__, cudaGetErrorString(err), attempts, max_attempts); \
+            if (attempts >= max_attempts) break; \
+            std::this_thread::sleep_for(std::chrono::milliseconds(500)); \
+        } \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "[cussl] FATAL: CUDA init failed at %s:%d - %s after %d attempts\n", \
+                    __FILE__, __LINE__, cudaGetErrorString(err), max_attempts); \
+            return; \
+        } \
+    } while(0)
 
+using Encaps768 = decltype(ML_KEM_768{} + Function<function::Encaps>() + Block() + BlockDim<128>());
 
 static uint8_t *g_d_pk = nullptr;
 static uint8_t *g_d_ct = nullptr;
@@ -32,7 +55,9 @@ static uint8_t *g_h_ss = nullptr;
 static uint8_t *g_h_entropy = nullptr;
 
 static cudaStream_t g_stream;
-static std::once_flag init_flag; /* Thread-safe init flag */
+static std::once_flag init_flag;
+static std::atomic<bool> g_init_ok{false};
+static std::mutex g_dispatch_mutex;
 
 /* --- PCIe/kernel timing instrumentation --- */
 static cudaEvent_t g_ev_start, g_ev_h2d_done, g_ev_kernel_done, g_ev_d2h_done;
@@ -40,42 +65,40 @@ static bool g_profile_enabled = false;
 
 const int MAX_CAPACITY = 2048;
 
-/* --- EXPLICIT THREAD-SAFE INITIALIZATION --- */
 void init_cuda_buffers() {
 
-/*Runtime check to safely verify the stride contract without crashing nvcc */
     if (Encaps768::entropy_size != 32) {
         fprintf(stderr, "FATAL: cuPQC SDK entropy size does not match OpenSSL's 32-byte requirement!\n");
         exit(1);
     }
-    CUDA_CHECK(cudaMalloc(&g_d_pk, MAX_CAPACITY * Encaps768::public_key_size));
-    CUDA_CHECK(cudaMalloc(&g_d_ct, MAX_CAPACITY * Encaps768::ciphertext_size));
-    CUDA_CHECK(cudaMalloc(&g_d_ss, MAX_CAPACITY * Encaps768::shared_secret_size));
-    CUDA_CHECK(cudaMalloc(&g_d_entropy, MAX_CAPACITY * Encaps768::entropy_size));
-    CUDA_CHECK(cudaMalloc(&g_d_workspace, MAX_CAPACITY * Encaps768::workspace_size));
+    CUDA_CHECK_RETRY(cudaMalloc(&g_d_pk, MAX_CAPACITY * Encaps768::public_key_size));
+    CUDA_CHECK_RETRY(cudaMalloc(&g_d_ct, MAX_CAPACITY * Encaps768::ciphertext_size));
+    CUDA_CHECK_RETRY(cudaMalloc(&g_d_ss, MAX_CAPACITY * Encaps768::shared_secret_size));
+    CUDA_CHECK_RETRY(cudaMalloc(&g_d_entropy, MAX_CAPACITY * Encaps768::entropy_size));
+    CUDA_CHECK_RETRY(cudaMalloc(&g_d_workspace, MAX_CAPACITY * Encaps768::workspace_size));
 
-    /* Zero out the workspace memory safely */
-    CUDA_CHECK(cudaMemset(g_d_workspace, 0, MAX_CAPACITY * Encaps768::workspace_size));
+    CUDA_CHECK_RETRY(cudaMemset(g_d_workspace, 0, MAX_CAPACITY * Encaps768::workspace_size));
 
-    CUDA_CHECK(cudaHostAlloc(&g_h_pk, MAX_CAPACITY * Encaps768::public_key_size, cudaHostAllocDefault));
-    CUDA_CHECK(cudaHostAlloc(&g_h_ct, MAX_CAPACITY * Encaps768::ciphertext_size, cudaHostAllocDefault));
-    CUDA_CHECK(cudaHostAlloc(&g_h_ss, MAX_CAPACITY * Encaps768::shared_secret_size, cudaHostAllocDefault));
-    CUDA_CHECK(cudaHostAlloc(&g_h_entropy, MAX_CAPACITY * Encaps768::entropy_size, cudaHostAllocDefault));
+    CUDA_CHECK_RETRY(cudaHostAlloc(&g_h_pk, MAX_CAPACITY * Encaps768::public_key_size, cudaHostAllocDefault));
+    CUDA_CHECK_RETRY(cudaHostAlloc(&g_h_ct, MAX_CAPACITY * Encaps768::ciphertext_size, cudaHostAllocDefault));
+    CUDA_CHECK_RETRY(cudaHostAlloc(&g_h_ss, MAX_CAPACITY * Encaps768::shared_secret_size, cudaHostAllocDefault));
+    CUDA_CHECK_RETRY(cudaHostAlloc(&g_h_entropy, MAX_CAPACITY * Encaps768::entropy_size, cudaHostAllocDefault));
 
-    /* Create the stream ONCE and reuse it forever */
-    CUDA_CHECK(cudaStreamCreate(&g_stream));
+    CUDA_CHECK_RETRY(cudaStreamCreate(&g_stream));
 
     /* --- PCIe/kernel timing instrumentation: create reusable events --- */
-    CUDA_CHECK(cudaEventCreate(&g_ev_start));
-    CUDA_CHECK(cudaEventCreate(&g_ev_h2d_done));
-    CUDA_CHECK(cudaEventCreate(&g_ev_kernel_done));
-    CUDA_CHECK(cudaEventCreate(&g_ev_d2h_done));
+    CUDA_CHECK_RETRY(cudaEventCreate(&g_ev_start));
+    CUDA_CHECK_RETRY(cudaEventCreate(&g_ev_h2d_done));
+    CUDA_CHECK_RETRY(cudaEventCreate(&g_ev_kernel_done));
+    CUDA_CHECK_RETRY(cudaEventCreate(&g_ev_d2h_done));
 
     const char* prof = getenv("CUPQC_PROFILE");
     g_profile_enabled = (prof != nullptr && prof[0] == '1');
     if (g_profile_enabled) {
-        fprintf(stderr, "[cupqc_shim] Profiling enabled (CUPQC_PROFILE=1) — per-batch H2D/kernel/D2H timing will print to stderr\n");
+        fprintf(stderr, "[cussl] Profiling enabled (CUPQC_PROFILE=1) -- per-dispatch H2D/kernel/D2H timing will print to stderr\n");
     }
+
+    g_init_ok.store(true, std::memory_order_release);
 }
 
 __global__ void kernel_encaps_batch(
@@ -109,8 +132,14 @@ void cupqc_encaps_mlkem768_batch(
 ) {
     if (count <= 0 || count > MAX_CAPACITY) return;
 
-    /*  FIX: Native C++ Thread Safety. Guarantees allocations happen exactly once. */
     std::call_once(init_flag, init_cuda_buffers);
+
+    if (!g_init_ok.load(std::memory_order_acquire)) {
+        fprintf(stderr, "[cussl] GPU not initialized for this worker, refusing dispatch (count=%d)\n", count);
+        return;
+    }
+
+    std::lock_guard<std::mutex> dispatch_lock(g_dispatch_mutex);
 
     // GATHER
     for (int i = 0; i < count; i++) {
@@ -120,7 +149,7 @@ void cupqc_encaps_mlkem768_batch(
         }
     }
 
-    // COPY & LAUNCH (Using persistent g_stream)
+    // COPY & LAUNCH
     if (g_profile_enabled) CUDA_CHECK(cudaEventRecord(g_ev_start, g_stream));
 
     CUDA_CHECK(cudaMemcpyAsync(g_d_pk, g_h_pk, count * Encaps768::public_key_size, cudaMemcpyHostToDevice, g_stream));
@@ -145,7 +174,7 @@ void cupqc_encaps_mlkem768_batch(
         cudaEventElapsedTime(&ms_kernel, g_ev_h2d_done, g_ev_kernel_done);
         cudaEventElapsedTime(&ms_d2h, g_ev_kernel_done, g_ev_d2h_done);
         cudaEventElapsedTime(&ms_total, g_ev_start, g_ev_d2h_done);
-        fprintf(stderr, "[cupqc_shim] batch=%d h2d_us=%.2f kernel_us=%.2f d2h_us=%.2f total_us=%.2f\n",
+        fprintf(stderr, "[cussl] batch=%d h2d_us=%.2f kernel_us=%.2f d2h_us=%.2f total_us=%.2f\n",
                 count, ms_h2d * 1000.0f, ms_kernel * 1000.0f, ms_d2h * 1000.0f, ms_total * 1000.0f);
     }
 
